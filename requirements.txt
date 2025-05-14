@@ -1,0 +1,7 @@
+openai==0.28
+discord.py
+python-dotenv
+langchain
+langchain-community
+faiss-cpu
+sentence-transformers
