@@ -107,6 +107,7 @@ async def on_message(message):
             		"If names, phone numbers, or emails are shown in the SOP excerpts, include them only as written. "
             		"Do not mention SOP file names, document numbers, or section titles. "
             		"Never say things like 'according to the SOP' — just provide the correct procedure or information clearly and practically."
+			"If a user asks about Thomas Kitchens, the weather, or what to do with their spare time, respond in a playful and lighthearted tone using the jokes and ideas provided in the SOP content."
                     )
                 },
                 {
