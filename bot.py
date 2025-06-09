@@ -1,5 +1,4 @@
 import os
-import re
 import openai
 import discord
 from discord.ext import commands
@@ -12,6 +11,7 @@ import time
 from collections import defaultdict
 import openai.error
 
+
 # --------- API KEYS (use .env or Render secrets in production) ---------
 openai.api_key = os.getenv("OPENAI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -21,8 +21,9 @@ INDEX_FILE = "sop_index.faiss"
 META_FILE = "sop_chunks.pkl"
 MODEL_NAME = "gpt-3.5-turbo"
 COOLDOWN_SECONDS = 10
+MAX_TOKENS = 1000
 
-# --------- Load FAISS Index & Metadata ---------
+# --------- Load FAISS & Metadata ---------
 if not os.path.exists(INDEX_FILE) or not os.path.exists(META_FILE):
     raise FileNotFoundError("❌ Missing FAISS index or metadata file.")
 
@@ -30,8 +31,8 @@ index = faiss.read_index(INDEX_FILE)
 with open(META_FILE, "rb") as f:
     metadata = pickle.load(f)
 
-# --------- Embedding Model ---------
-EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+# --------- Embedding Model (CPU-only for stability) ---------
+EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
 # --------- Discord Setup ---------
 intents = discord.Intents.default()
@@ -41,16 +42,31 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # --------- Cooldown Tracker ---------
 user_last_asked = defaultdict(lambda: 0)
 
+# --------- Safe Send Helper ---------
+async def safe_send(channel, content):
+    try:
+        await channel.send(content)
+    except discord.errors.HTTPException as e:
+        if e.status == 429:
+            retry_after = 5.0
+            try:
+                if e.response and hasattr(e.response, "headers"):
+                    retry_after = float(e.response.headers.get("Retry-After", 5.0))
+            except Exception:
+                pass
+            print(f"🚦 Discord 429 hit. Retrying in {retry_after:.2f}s...")
+            await asyncio.sleep(retry_after)
+            await channel.send(content)
+        else:
+            print(f"⚠️ Send failed: {e}")
+
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user.name} is online!")
 
 @bot.command()
 async def ping(ctx):
-    try:
-        await ctx.send("✅ I'm alive!")
-    except discord.errors.HTTPException as e:
-        print(f"⚠️ Failed to send ping response: {str(e)}")
+    await safe_send(ctx, "✅ I'm alive!")
 
 def split_message(text, limit=2000):
     lines = text.split('\n')
@@ -76,41 +92,38 @@ async def on_message(message):
         user_id = message.author.id
 
         if now - user_last_asked[user_id] < COOLDOWN_SECONDS:
-            try:
-                await message.channel.send(
-                    f"⏳ {message.author.mention}, please wait a few seconds before asking again."
-                )
-            except discord.errors.HTTPException:
-                print("⚠️ Could not send cooldown warning due to rate limit.")
+            await safe_send(
+                message.channel,
+                f"⏳ {message.author.mention}, please wait a few seconds before asking again."
+            )
             return
 
         user_last_asked[user_id] = now
         user_question = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
         try:
-            # Step 1: Embed user question
+            # Step 1: Embed and search
             q_embedding = EMBEDDING_MODEL.encode([user_question])
-            D, I = index.search(np.array(q_embedding).astype("float32"), k=8)
+            D, I = index.search(np.array(q_embedding, dtype="float32"), k=5)
 
-            # Step 2: Build clean context from top matches
-            max_context_chars = 7000
+            # Step 2: Build context
             context_parts = []
             for i in I[0]:
                 if 0 <= i < len(metadata):
-                    excerpt = metadata[i]["content"]
-                    if len(excerpt.strip()) > 50:
-                        context_parts.append(f"- {excerpt.strip()}")
+                    content = metadata[i]['content'].strip()
+                    if len(content) > 50:
+                        context_parts.append(f"- {content}")
 
             if not context_parts:
-                await message.channel.send(
-                    f"📄 {message.author.mention} Sorry, I couldn’t find anything in the SOP to help with that. "
-                    "Please contact your manager or refer to AGCO guidelines for clarification."
+                await safe_send(
+                    message.channel,
+                    f"📄 {message.author.mention} Sorry, I couldn’t find anything in the SOP."
                 )
                 return
 
-            context = "\n".join(context_parts)[:max_context_chars]
+            context = "\n".join(context_parts)[:7000]
 
-            # Step 3: Construct OpenAI message
+            # Step 3: Build OpenAI prompt
             messages = [
                 {
                     "role": "system",
@@ -129,6 +142,7 @@ async def on_message(message):
                         "Do not mention SOP file names, document numbers, or section titles. "
                         "Never say things like 'according to the SOP' — just provide the correct procedure or information clearly and practically. "
                         "If a user asks about Thomas Kitchens, the weather, or what to do with their spare time, respond in a playful and lighthearted tone using the jokes and ideas provided in the SOP content."
+			"Feel free to include a light joke when appropriate, as long as it doesn’t affect the accuracy or clarity of the response. If a user explicitly asks for a joke, respond with one accordingly."
                     )
                 },
                 {
@@ -137,68 +151,42 @@ async def on_message(message):
                 }
             ]
 
-            # Step 4: Query OpenAI with retry logic
+            # Step 4: Call OpenAI with retry
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     response = openai.ChatCompletion.create(
                         model=MODEL_NAME,
                         messages=messages,
-                        max_tokens=600,
+                        max_tokens=MAX_TOKENS,
                         temperature=0.5
                     )
-                    break  # success
+                    break
                 except openai.error.RateLimitError:
-                    wait_time = 2 ** attempt
-                    print(f"⚠️ OpenAI rate limit hit. Retrying in {wait_time}s...")
-                    await asyncio.sleep(wait_time)
+                    wait = 2 ** attempt
+                    print(f"⚠️ OpenAI rate limit hit. Retrying in {wait}s...")
+                    await asyncio.sleep(wait)
                 except Exception as e:
-                    print(f"❌ OpenAI API error: {e}")
-                    await message.channel.send("⚠️ OpenAI error occurred. Please try again later.")
+                    print(f"❌ OpenAI error: {e}")
+                    await safe_send(message.channel, "⚠️ OpenAI error occurred.")
                     return
             else:
-                await message.channel.send("⚠️ OpenAI is currently overloaded. Please try again later.")
+                await safe_send(message.channel, "⚠️ OpenAI is overloaded. Please try again later.")
                 return
 
             answer = response.choices[0].message.content.strip()
+            full_response = f"🧠 {message.author.mention} {answer}"
 
-            # Step 5: Send reply with throttling and retry-on-429 logic
-            for chunk in split_message(f"🧠 {message.author.mention} {answer}"):
-                try:
-                    await message.channel.send(chunk)
-                    await asyncio.sleep(1)
-                except discord.errors.HTTPException as e:
-                    if e.status == 429:
-                        retry_after = None
-                        if e.response and hasattr(e.response, "headers"):
-                            retry_after = e.response.headers.get("Retry-After")
-                        try:
-                            wait_time = float(retry_after) if retry_after else 5.0
-                            print(f"⚠️ Rate limit hit. Waiting {wait_time:.2f} seconds before retrying...")
-                            await asyncio.sleep(wait_time)
-                            await message.channel.send(chunk)
-                            await asyncio.sleep(1)
-                        except Exception as retry_err:
-                            print(f"⚠️ Retry failed or invalid wait time: {retry_err}")
-                            break
-                    else:
-                        print(f"⚠️ Error sending message: {str(e)}")
-                        break
-
-        except discord.errors.HTTPException as e:
-            if e.status == 429:
-                print("⚠️ Rate limited. No error message sent.")
-            else:
-                await message.channel.send("⚠️ Something went wrong with Discord.")
-            print(f"Discord Error: {str(e)}")
+            # Step 5: Send message (split if needed)
+            for chunk in split_message(full_response):
+                await safe_send(message.channel, chunk)
+                await asyncio.sleep(1)
 
         except Exception as e:
-            await message.channel.send("⚠️ Something went wrong while processing your request.")
-            print(f"Error: {str(e)}")
+            print(f"❌ Unexpected error: {e}")
+            await safe_send(message.channel, "⚠️ Something went wrong.")
 
     await bot.process_commands(message)
 
 # --------- Run Bot ---------
 bot.run(DISCORD_TOKEN)
-
-

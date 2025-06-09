@@ -1,8 +1,8 @@
-openai==0.28
-discord.py
-python-dotenv
-langchain
-langchain-community
-faiss-cpu
-sentence-transformers
-numpy
+openai==0.28.0
+discord.py==2.5.2
+python-dotenv==1.1.0
+langchain==0.3.25
+langchain-community==0.3.23
+faiss-cpu==1.11.0
+sentence-transformers==4.1.0
+numpy==2.2.5
