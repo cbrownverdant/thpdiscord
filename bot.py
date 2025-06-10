@@ -10,29 +10,25 @@ import asyncio
 import time
 from collections import defaultdict
 import openai.error
+import gc
 
 
 # --------- API KEYS (use .env or Render secrets in production) ---------
 openai.api_key = os.getenv("OPENAI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# --------- Config ---------
+
+# --------- Config ---------o 
 INDEX_FILE = "sop_index.faiss"
 META_FILE = "sop_chunks.pkl"
 MODEL_NAME = "gpt-3.5-turbo"
 COOLDOWN_SECONDS = 10
 MAX_TOKENS = 1000
 
-# --------- Load FAISS & Metadata ---------
-if not os.path.exists(INDEX_FILE) or not os.path.exists(META_FILE):
-    raise FileNotFoundError("❌ Missing FAISS index or metadata file.")
-
-index = faiss.read_index(INDEX_FILE)
-with open(META_FILE, "rb") as f:
-    metadata = pickle.load(f)
-
-# --------- Embedding Model (CPU-only for stability) ---------
-EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+# --------- Lazy Load Variables ---------
+index = None
+metadata = None
+EMBEDDING_MODEL = None
 
 # --------- Discord Setup ---------
 intents = discord.Intents.default()
@@ -84,6 +80,8 @@ def split_message(text, limit=2000):
 
 @bot.event
 async def on_message(message):
+    global index, metadata, EMBEDDING_MODEL
+
     if message.author == bot.user:
         return
 
@@ -102,6 +100,23 @@ async def on_message(message):
         user_question = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
         try:
+            # Lazy load index
+            if index is None:
+                if not os.path.exists(INDEX_FILE):
+                    raise FileNotFoundError("❌ FAISS index missing.")
+                index = faiss.read_index(INDEX_FILE)
+
+            # Lazy load metadata
+            if metadata is None:
+                if not os.path.exists(META_FILE):
+                    raise FileNotFoundError("❌ Metadata pickle missing.")
+                with open(META_FILE, "rb") as f:
+                    metadata = pickle.load(f)
+
+            # Lazy load embedding model
+            if EMBEDDING_MODEL is None:
+                EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+
             # Step 1: Embed and search
             q_embedding = EMBEDDING_MODEL.encode([user_question])
             D, I = index.search(np.array(q_embedding, dtype="float32"), k=5)
@@ -141,8 +156,8 @@ async def on_message(message):
                         "If names, phone numbers, or emails are shown in the SOP excerpts, include them only as written. "
                         "Do not mention SOP file names, document numbers, or section titles. "
                         "Never say things like 'according to the SOP' — just provide the correct procedure or information clearly and practically. "
-                        "If a user asks about Thomas Kitchens, the weather, or what to do with their spare time, respond in a playful and lighthearted tone using the jokes and ideas provided in the SOP content."
-			"Feel free to include a light joke when appropriate, as long as it doesn’t affect the accuracy or clarity of the response. If a user explicitly asks for a joke, respond with one accordingly."
+                        "If a user asks about Thomas Kitchens, the weather, or what to do with their spare time, respond in a playful and lighthearted tone using the jokes and ideas provided in the SOP content. "
+                        "Feel free to include a light joke when appropriate, as long as it doesn’t affect the accuracy or clarity of the response. If a user explicitly asks for a joke, respond with one accordingly."
                     )
                 },
                 {
@@ -181,6 +196,10 @@ async def on_message(message):
             for chunk in split_message(full_response):
                 await safe_send(message.channel, chunk)
                 await asyncio.sleep(1)
+
+            # Clean up memory
+            del q_embedding, D, I, context_parts, context, messages, response, answer
+            gc.collect()
 
         except Exception as e:
             print(f"❌ Unexpected error: {e}")
