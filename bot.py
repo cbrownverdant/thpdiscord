@@ -18,7 +18,7 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 
-# --------- Config ---------o 
+# --------- Config ---------
 INDEX_FILE = "sop_index.faiss"
 META_FILE = "sop_chunks.pkl"
 MODEL_NAME = "gpt-3.5-turbo"
@@ -118,7 +118,7 @@ async def on_message(message):
                 EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
             # Step 1: Embed and search
-            q_embedding = EMBEDDING_MODEL.encode([user_question])
+            q_embedding = await asyncio.to_thread(EMBEDDING_MODEL.encode, [user_question])
             D, I = index.search(np.array(q_embedding, dtype="float32"), k=5)
 
             # Step 2: Build context
