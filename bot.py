@@ -87,8 +87,10 @@ def split_message(text, limit=2000):
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user.name} is online!")
-    memory_logger_task.start()
+    if not memory_logger_task.is_running():
+        memory_logger_task.start()
     bot.loop.create_task(auto_restart_timer())
+
 
 @bot.event
 async def on_message(message):
