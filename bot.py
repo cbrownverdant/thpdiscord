@@ -1,7 +1,7 @@
 import os
 import openai
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import faiss
 import pickle
 import numpy as np
@@ -11,12 +11,12 @@ import time
 from collections import defaultdict
 import openai.error
 import gc
+import psutil
 
 
 # --------- API KEYS (use .env or Render secrets in production) ---------
 openai.api_key = os.getenv("OPENAI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
 
 # --------- Config ---------
 INDEX_FILE = "sop_index.faiss"
@@ -24,50 +24,55 @@ META_FILE = "sop_chunks.pkl"
 MODEL_NAME = "gpt-3.5-turbo"
 COOLDOWN_SECONDS = 10
 MAX_TOKENS = 1000
+MEMORY_THRESHOLD_MB = 400 
 
 # --------- Lazy Load Variables ---------
 index = None
 metadata = None
 EMBEDDING_MODEL = None
+user_last_asked = defaultdict(lambda: 0)
 
 # --------- Discord Setup ---------
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, max_messages=0)
 
-# --------- Cooldown Tracker ---------
-user_last_asked = defaultdict(lambda: 0)
+# --------- Memory Management ---------
+def log_memory_usage(label=""):
+    mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+    print(f"[{time.ctime()}] 🧠 {label} - RSS: {mem_mb:.2f} MB")
+    return mem_mb
 
-# --------- Safe Send Helper ---------
+def maybe_unload_memory(force=False):
+    global index, metadata, EMBEDDING_MODEL
+    mem = log_memory_usage("Memory Check")
+    if force or mem > MEMORY_THRESHOLD_MB:
+        print("⚠️ Memory exceeded threshold. Releasing memory.")
+        index = metadata = EMBEDDING_MODEL = None
+        gc.collect()
+        log_memory_usage("After memory cleanup")
+
+@tasks.loop(minutes=10)
+async def memory_logger_task():
+    maybe_unload_memory()
+
+async def auto_restart_timer():
+    await asyncio.sleep(6 * 60 * 60)  # Restart every 6 hours
+    print("🔁 Auto-restarting to avoid memory leaks...")
+    os._exit(0)
+
+# --------- Helpers ---------
 async def safe_send(channel, content):
     try:
         await channel.send(content)
     except discord.errors.HTTPException as e:
-        if e.status == 429:
-            retry_after = 5.0
-            try:
-                if e.response and hasattr(e.response, "headers"):
-                    retry_after = float(e.response.headers.get("Retry-After", 5.0))
-            except Exception:
-                pass
-            print(f"🚦 Discord 429 hit. Retrying in {retry_after:.2f}s...")
-            await asyncio.sleep(retry_after)
-            await channel.send(content)
-        else:
-            print(f"⚠️ Send failed: {e}")
-
-@bot.event
-async def on_ready():
-    print(f"✅ {bot.user.name} is online!")
-
-@bot.command()
-async def ping(ctx):
-    await safe_send(ctx, "✅ I'm alive!")
+        retry_after = float(e.response.headers.get("Retry-After", 5.0)) if e.response else 5.0
+        print(f"🚦 Discord 429 hit. Retrying in {retry_after:.2f}s...")
+        await asyncio.sleep(retry_after)
+        await channel.send(content)
 
 def split_message(text, limit=2000):
-    lines = text.split('\n')
-    chunks = []
-    current = ""
+    lines, chunks, current = text.split('\n'), [], ""
     for line in lines:
         if len(current) + len(line) + 1 <= limit:
             current += line + "\n"
@@ -77,6 +82,13 @@ def split_message(text, limit=2000):
     if current.strip():
         chunks.append(current.strip())
     return chunks
+
+# --------- Events ---------
+@bot.event
+async def on_ready():
+    print(f"✅ {bot.user.name} is online!")
+    memory_logger_task.start()
+    bot.loop.create_task(auto_restart_timer())
 
 @bot.event
 async def on_message(message):
@@ -90,38 +102,34 @@ async def on_message(message):
         user_id = message.author.id
 
         if now - user_last_asked[user_id] < COOLDOWN_SECONDS:
-            await safe_send(
-                message.channel,
-                f"⏳ {message.author.mention}, please wait a few seconds before asking again."
-            )
+            await safe_send(message.channel, f"⏳ {message.author.mention}, please wait a few seconds before asking again.")
             return
 
         user_last_asked[user_id] = now
         user_question = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
         try:
-            # Lazy load index
+            # Load FAISS index if not already loaded
             if index is None:
                 if not os.path.exists(INDEX_FILE):
                     raise FileNotFoundError("❌ FAISS index missing.")
                 index = faiss.read_index(INDEX_FILE)
 
-            # Lazy load metadata
+            # Load metadata
             if metadata is None:
                 if not os.path.exists(META_FILE):
                     raise FileNotFoundError("❌ Metadata pickle missing.")
                 with open(META_FILE, "rb") as f:
                     metadata = pickle.load(f)
 
-            # Lazy load embedding model
+            # Load embedding model only if not in memory
             if EMBEDDING_MODEL is None:
                 EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
-            # Step 1: Embed and search
+            # Encode the question
             q_embedding = await asyncio.to_thread(EMBEDDING_MODEL.encode, [user_question])
             D, I = index.search(np.array(q_embedding, dtype="float32"), k=5)
 
-            # Step 2: Build context
             context_parts = []
             for i in I[0]:
                 if 0 <= i < len(metadata):
@@ -130,15 +138,12 @@ async def on_message(message):
                         context_parts.append(f"- {content}")
 
             if not context_parts:
-                await safe_send(
-                    message.channel,
-                    f"📄 {message.author.mention} Sorry, I couldn’t find anything in the SOP."
-                )
+                await safe_send(message.channel, f"📄 {message.author.mention} Sorry, I couldn’t find anything in the SOP.")
                 return
 
             context = "\n".join(context_parts)[:7000]
 
-            # Step 3: Build OpenAI prompt
+            # Compose message for OpenAI
             messages = [
                 {
                     "role": "system",
@@ -159,16 +164,17 @@ async def on_message(message):
                         "If a user asks about Thomas Kitchens, the weather, or what to do with their spare time, respond in a playful and lighthearted tone using the jokes and ideas provided in the SOP content. "
                         "Feel free to include a light joke when appropriate, as long as it doesn’t affect the accuracy or clarity of the response. If a user explicitly asks for a joke, respond with one accordingly."
                     )
+
                 },
+
                 {
                     "role": "user",
                     "content": f"Relevant SOP Excerpts:\n{context}\n\nUser Question: {user_question}"
                 }
             ]
 
-            # Step 4: Call OpenAI with retry
-            max_retries = 3
-            for attempt in range(max_retries):
+            # Send to OpenAI with retry
+            for attempt in range(3):
                 try:
                     response = openai.ChatCompletion.create(
                         model=MODEL_NAME,
@@ -192,14 +198,20 @@ async def on_message(message):
             answer = response.choices[0].message.content.strip()
             full_response = f"🧠 {message.author.mention} {answer}"
 
-            # Step 5: Send message (split if needed)
             for chunk in split_message(full_response):
                 await safe_send(message.channel, chunk)
                 await asyncio.sleep(1)
 
-            # Clean up memory
+            # Clean up
             del q_embedding, D, I, context_parts, context, messages, response, answer
             gc.collect()
+
+            # Unload model only if needed
+            if log_memory_usage("Post-response check") > MEMORY_THRESHOLD_MB:
+                EMBEDDING_MODEL = None
+                gc.collect()
+
+            maybe_unload_memory()
 
         except Exception as e:
             print(f"❌ Unexpected error: {e}")
@@ -209,3 +221,5 @@ async def on_message(message):
 
 # --------- Run Bot ---------
 bot.run(DISCORD_TOKEN)
+
+

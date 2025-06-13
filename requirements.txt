@@ -4,3 +4,6 @@ faiss-cpu==1.7.4
 numpy==1.24.4
 sentence-transformers==4.1.0
 huggingface-hub>=0.20.0
+scipy>=1.9.3
+torch>=1.12.1
+psutil==5.9.8
